@@ -643,6 +643,9 @@ export abstract class BaseLanguageClient implements FeatureClient<Middleware, La
 	private _state: ClientState;
 	private _onStart: Promise<void> | undefined;
 	private _onStop: Promise<void> | undefined;
+	// Set when the close handler restarts the client and reported the close as handled.
+	// The next start() then logs a failure without forcing a notification.
+	private _restartHandled: boolean = false;
 	private _connection: Connection | undefined;
 	private _idleInterval: Disposable | undefined;
 	private readonly _ignoredRegistrations: Set<string>;
@@ -1297,6 +1300,8 @@ export abstract class BaseLanguageClient implements FeatureClient<Middleware, La
 	}
 
 	public async start(): Promise<void> {
+		const restartHandled = this._restartHandled;
+		this._restartHandled = false;
 		if (this._disposed === 'disposing' || this._disposed === 'disposed') {
 			throw new Error(`Client got disposed and can't be restarted.`);
 		}
@@ -1426,7 +1431,7 @@ export abstract class BaseLanguageClient implements FeatureClient<Middleware, La
 			resolve();
 		} catch (error) {
 			this.$state = ClientState.StartFailed;
-			this.error(`${this._name} client: couldn't create connection to server.`, error, 'force');
+			this.error(`${this._name} client: couldn't create connection to server.`, error, restartHandled ? false : 'force');
 			reject(error);
 		}
 		return promise;
@@ -1905,7 +1910,8 @@ export abstract class BaseLanguageClient implements FeatureClient<Middleware, La
 			this.$state = ClientState.Initial;
 			this._onStop = Promise.resolve();
 			this._onStart = undefined;
-			this.start().catch((error) => this.error(`Restarting server failed`, error, 'force'));
+			this._restartHandled = handled;
+			this.start().catch((error) => this.error(`Restarting server failed`, error, handled ? false : 'force'));
 		}
 	}
 

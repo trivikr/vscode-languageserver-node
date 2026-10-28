@@ -5,6 +5,7 @@
 'use strict';
 
 import * as assert from 'assert';
+import * as cp from 'child_process';
 import * as path from 'path';
 import * as sinon from 'sinon';
 import * as vscode from 'vscode';
@@ -2769,6 +2770,79 @@ suite('Server tests', () => {
 				await client.dispose();
 			}
 		}
+	});
+
+	async function testRestartFailure(handled: boolean): Promise<{ errorLog: sinon.SinonStub; showErrorMessage: sinon.SinonStub }> {
+		let starts = 0;
+		// The first start spawns a server that crashes on request. The restart triggered
+		// by the close handler fails since the server can no longer be created.
+		const serverOptions: lsclient.ServerOptions = async () => {
+			starts++;
+			if (starts > 1) {
+				throw new Error('Server is unavailable');
+			}
+			return cp.spawn(process.execPath, [path.join(__dirname, './servers/crashServer.js'), '--stdio'], {
+				// The tests run inside Electron, so process.execPath must be told to behave like node.
+				env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
+			});
+		};
+		const clientOptions: lsclient.LanguageClientOptions = {
+			errorHandler: {
+				error: () => ({ action: lsclient.ErrorAction.Continue }),
+				closed: () => ({ action: lsclient.CloseAction.Restart, handled }),
+			}
+		};
+		const client = new lsclient.LanguageClient('test svr', 'Test Language Server', serverOptions, clientOptions);
+		const sandbox = sinon.createSandbox();
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await client.start();
+			const showErrorMessage = sandbox.stub(vscode.window, 'showErrorMessage').resolves(undefined);
+			const error = client.error.bind(client);
+			// The restart runs detached from the close handler. Its failure is only observable
+			// through the `Restarting server failed` log, so wait for that.
+			let restartFailed!: () => void;
+			const onRestartFailed = new Promise<void>(resolve => restartFailed = resolve);
+			const errorLog = sandbox.stub(client, 'error').callsFake((message: string, data?: any, showNotification?: boolean | 'force') => {
+				error(message, data, showNotification);
+				if (/Restarting server failed/.test(message)) {
+					restartFailed();
+				}
+			});
+			await client.sendNotification(CrashNotification.type);
+			// Bound the wait so a missing restart cannot leave the global stub installed.
+			await Promise.race([
+				onRestartFailed,
+				new Promise<never>((_, reject) => {
+					timeout = setTimeout(() => reject(new Error('Timed out waiting for the restart to fail')), 2000);
+				})
+			]);
+			assert.strictEqual(starts, 2, 'expected exactly one restart attempt');
+			assert.strictEqual(client.state, lsclient.State.StartFailed);
+			return { errorLog, showErrorMessage };
+		} finally {
+			clearTimeout(timeout);
+			sandbox.restore();
+			client.diagnostics?.dispose();
+		}
+	}
+
+	test('Failed restart after a handled close is logged without a notification', async () => {
+		const { errorLog, showErrorMessage } = await testRestartFailure(true);
+		const connectLog = errorLog.getCalls().find(call => /couldn't create connection to server/.test(call.args[0]));
+		assert.ok(connectLog !== undefined, 'expected the connection failure to be logged');
+		assert.strictEqual(connectLog.args[2], false, 'the connection failure must not request a notification');
+		const restartLog = errorLog.getCalls().find(call => /Restarting server failed/.test(call.args[0]));
+		assert.ok(restartLog !== undefined, 'expected the restart failure to be logged');
+		assert.strictEqual(restartLog.args[2], false, 'the restart failure must not request a notification');
+		assert.strictEqual(showErrorMessage.called, false, 'no error notification must be shown');
+	});
+
+	test('Failed restart after an unhandled close shows a notification', async () => {
+		const { showErrorMessage } = await testRestartFailure(false);
+		const messages = showErrorMessage.getCalls().map(call => call.args[0]);
+		assert.ok(messages.some(message => /couldn't create connection to server/.test(message)), 'expected a connection failure notification');
+		assert.ok(messages.some(message => /Restarting server failed/.test(message)), 'expected a restart failure notification');
 	});
 
 	test('Stop fails if server shutdown request times out', async () => {
